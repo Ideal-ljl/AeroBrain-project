@@ -1,15 +1,7 @@
-"""
-Expert model for OpenFLY, adapted for Qwen3.5 architecture.
-
-Key differences from Qwen3-VL expert:
-- Standard 2D RoPE (not MRoPE with 3D T/H/W position IDs)
-- q_proj outputs head_dim*2, split into query + gate; gate applied after o_proj
-- RMSNorm uses (1 + weight) style (zero-init weight)
-- position_ids are 2D (batch, seq_len) instead of 3D
-"""
+"""Qwen action Expert with rotary attention and shared prefix state."""
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -17,16 +9,14 @@ import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMixin
-from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+from transformers.utils import TransformersKwargs
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
@@ -63,7 +53,9 @@ def gated_delta_net_forward_with_state(
     batch_size, seq_len, _ = hidden_states.shape
 
     mixed_qkv = module.in_proj_qkv(hidden_states).transpose(1, 2)
-    z = module.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, module.head_v_dim)
+    z = module.in_proj_z(hidden_states).reshape(
+        batch_size, seq_len, -1, module.head_v_dim
+    )
     beta = module.in_proj_b(hidden_states).sigmoid()
     a = module.in_proj_a(hidden_states)
 
@@ -90,13 +82,6 @@ def gated_delta_net_forward_with_state(
 
     g = -module.A_log.float().exp() * F.softplus(a.float() + module.dt_bias)
 
-    # Padding steps must not evolve the recurrent state. `g` and `beta` are
-    # non-zero even where the hidden state was zeroed (`in_proj_a`/`in_proj_b`
-    # feed softplus/sigmoid), so with the right-padding this repo uses, the
-    # returned final state is the real end-of-sequence state decayed by n_pad
-    # extra steps — a per-sample-random attenuation of the handoff. g=0 makes
-    # the decay factor exp(0)=1 and beta=0 drops the delta update, so a pad
-    # step becomes an identity. Causality keeps real positions untouched.
     if (
         attention_mask is not None
         and attention_mask.dim() == 2
@@ -138,7 +123,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    # Qwen3.5 uses partial rotary: cos/sin may cover only the first rotary_dim elements
+
     rotary_dim = cos.shape[-1]
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
@@ -151,7 +136,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -173,17 +160,17 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
+    attn_weights = nn.functional.dropout(
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
 
-
-# ---------------------------------------------------------------------------
-# MLP
-# ---------------------------------------------------------------------------
 
 class Qwen3_5ExpertMLP(nn.Module):
     def __init__(self, config):
@@ -212,8 +199,12 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -225,7 +216,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         linear_initial_recurrent_state: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.FloatTensor:
-        # ── Self-attention (or linear attention) ────────────────────────────
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -255,18 +246,13 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
             )
         hidden_states = residual + hidden_states
 
-        # ── FFN ─────────────────────────────────────────────────────────────
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
-    
-    
-# ---------------------------------------------------------------------------
-# Output dataclass
-# ---------------------------------------------------------------------------
+
 
 @dataclass
 class ExpertModelOutputWithPast(ModelOutput):
@@ -275,10 +261,6 @@ class ExpertModelOutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
 
-
-# ---------------------------------------------------------------------------
-# Pre-trained model base
-# ---------------------------------------------------------------------------
 
 class Qwen3_5ExpertPreTrainedModel(PreTrainedModel):
     config_class = Qwen3_5TextConfig
@@ -291,10 +273,6 @@ class Qwen3_5ExpertPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
 
-
-# ---------------------------------------------------------------------------
-# ActionRouterHead
-# ---------------------------------------------------------------------------
 
 class ActionRouterHead(nn.Module):
     def __init__(self, hidden_size, n_clusters, num_layers=8):
@@ -314,10 +292,6 @@ class ActionRouterHead(nn.Module):
         logits = torch.softmax(logits, dim=-1)
         return logits
 
-
-# ---------------------------------------------------------------------------
-# Expert Model
-# ---------------------------------------------------------------------------
 
 class Qwen3_5ExpertModel(Qwen3_5TextModel):
     """
@@ -339,18 +313,17 @@ class Qwen3_5ExpertModel(Qwen3_5TextModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        # 删除从父类继承的 embed_tokens，expert 只接收 inputs_embeds
         del self.embed_tokens
         self.layers = nn.ModuleList(
-            [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                Qwen3_5DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.share_linear_attention_state = bool(share_linear_attention_state)
-
-
-
 
         self.action_in_proj = nn.Linear(action_dim, config.hidden_size)
         self.state_proj = nn.Linear(state_dim, config.hidden_size)
@@ -377,24 +350,31 @@ class Qwen3_5ExpertModel(Qwen3_5TextModel):
         past_key_values_seq_length: Optional[int] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
-        
+
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        
-        # if inputs_embeds is None:
-        #     inputs_embeds = self.embed_tokens(input_ids)
-        
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
+
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        # the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
             if past_key_values_seq_length is not None:
                 past_seen_tokens = past_key_values_seq_length
             else:
-                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+                past_seen_tokens = (
+                    past_key_values.get_seq_length()
+                    if past_key_values is not None
+                    else 0
+                )
+            position_ids = (
+                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+                + past_seen_tokens
+            )
+            position_ids = position_ids.view(1, 1, -1).expand(
+                4, inputs_embeds.shape[0], -1
+            )
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -403,7 +383,6 @@ class Qwen3_5ExpertModel(Qwen3_5TextModel):
             position_ids = position_ids[1:]
         else:
             text_position_ids = None
-
 
         if full_suffix_attention and past_key_values is not None:
             batch_size, query_length = inputs_embeds.shape[:2]
@@ -414,7 +393,9 @@ class Qwen3_5ExpertModel(Qwen3_5TextModel):
             )
             key_value_length = prefix_key_value_length + query_length
             if attention_mask is not None:
-                causal_mask = attention_mask.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+                causal_mask = attention_mask.to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                )
                 if causal_mask.shape[-2:] != (query_length, key_value_length):
                     raise ValueError(
                         "full_suffix_attention mask shape mismatch: "
@@ -438,13 +419,19 @@ class Qwen3_5ExpertModel(Qwen3_5TextModel):
                 past_key_values=past_key_values,
                 position_ids=text_position_ids,
             )
-            linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
+            linear_attn_mask = self._update_linear_attn_mask(
+                attention_mask, past_key_values
+            )
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
+            layer_mask = (
+                linear_attn_mask
+                if self.config.layer_types[i] == "linear_attention"
+                else causal_mask
+            )
 
             is_linear_layer = self.config.layer_types[i] == "linear_attention"
             linear_initial_recurrent_state = None
@@ -455,11 +442,13 @@ class Qwen3_5ExpertModel(Qwen3_5TextModel):
                 and past_key_values is not None
                 and past_key_values.has_previous_state(i)
             ):
-                linear_initial_recurrent_state = past_key_values.layers[i].recurrent_states
+                linear_initial_recurrent_state = past_key_values.layers[
+                    i
+                ].recurrent_states
 
-            # Never mutate the cached VLM linear state with a noisy action
-            # suffix. Each denoising step must start from the same prefix state.
-            layer_past_key_values = None if full_suffix_attention and is_linear_layer else past_key_values
+            layer_past_key_values = (
+                None if full_suffix_attention and is_linear_layer else past_key_values
+            )
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,

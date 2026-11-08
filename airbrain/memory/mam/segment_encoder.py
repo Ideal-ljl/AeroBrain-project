@@ -1,23 +1,9 @@
-"""MAM segment encoder.
-
-Per detected event, a small cross-attention block produces `tokens_per_event`
-memory tokens from:
-  Q : action-segment content encoding for the segment that ends at this event
-  K/V : patch features from the segment's start frame and end frame
-        (gives the cross-attention access to a "differential" view across the segment)
-
-Event age/recency is added after cross-attention by `MAMMemoryEncoder`, so the
-cross-attended content token can be cached independently of runtime age.
-
-The implementation runs the per-event cross-attention in a single batched call by
-gathering features into a `[B·E, ...]` layout, where E = M_max.
-"""
+"""Action-segment queries and cross-attention over endpoint image patches."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class ActionSegmentEncoder(nn.Module):
@@ -50,57 +36,45 @@ class ActionSegmentEncoder(nn.Module):
             nn.GELU(),
         )
         self.head = nn.Linear(hidden_dim, d_model)
-        # Kept here for checkpoint compatibility, but applied after visual
-        # cross-attention so event content tokens can be cached by segment.
+
         self.age_embedding = nn.Embedding(max_age, d_model)
         self.query_norm = nn.LayerNorm(d_model)
-        # Per-token learned offsets that break the within-event symmetry. The
-        # action-segment encoding produces ONE query per event; without these
-        # offsets, expanding it to `tokens_per_event` queries would feed
-        # identical Q rows to a position-wise cross-attention, so the output
-        # tokens collapse to one repeated vector and `(tokens_per_event - 1)`
-        # of every event's KV slots are wasted.
+
         self.token_offsets = nn.Parameter(torch.empty(tokens_per_event, d_model))
         nn.init.normal_(self.token_offsets, mean=0.0, std=0.02)
 
     def forward(
         self,
-        segment_actions: torch.Tensor,         # [N, L_max, A]
-        segment_lengths: torch.Tensor,         # [N] valid length per segment
-        ages: torch.Tensor,                    # [N] retained for API compatibility
+        segment_actions: torch.Tensor,
+        segment_lengths: torch.Tensor,
+        ages: torch.Tensor,
     ) -> torch.Tensor:
         """Return `[N, tokens_per_event, d_model]` query vectors."""
         if segment_actions.ndim != 3:
             raise ValueError(f"expected [N, L, A], got {tuple(segment_actions.shape)}")
         N, L_max, A = segment_actions.shape
 
-        # Build mask [N, L_max] from lengths
         ar = torch.arange(L_max, device=segment_actions.device)[None, :]
         valid = ar < segment_lengths[:, None].clamp_min(0)
         x = segment_actions * valid.unsqueeze(-1).to(segment_actions.dtype)
 
-        # [N, A, L_max]
         x = x.transpose(1, 2)
-        h = self.conv(x)  # [N, hidden, L_max]
+        h = self.conv(x)
 
-        # Adaptive avg pool over valid length: use masked mean instead of plain
-        # adaptive pool to respect variable lengths.
-        valid_t = valid.unsqueeze(1).to(h.dtype)  # [N, 1, L_max]
+        valid_t = valid.unsqueeze(1).to(h.dtype)
         h = h * valid_t
-        valid_count = valid_t.sum(dim=-1).clamp_min(1.0)  # [N, 1]
-        pooled = h.sum(dim=-1) / valid_count               # [N, hidden]
+        valid_count = valid_t.sum(dim=-1).clamp_min(1.0)
+        pooled = h.sum(dim=-1) / valid_count
 
-        q = self.head(pooled)                              # [N, d_model]
+        q = self.head(pooled)
         q = self.query_norm(q)
 
-        # Expand to `tokens_per_event` queries. The learned per-token offsets
-        # break the within-event symmetry — without them every query row would
-        # be identical and `nn.MultiheadAttention` (position-wise) would emit
-        # `tokens_per_event` copies of the same vector.
         q = q.unsqueeze(1) + self.token_offsets.to(dtype=q.dtype).unsqueeze(0)
-        return q  # [N, tokens_per_event, d_model]
+        return q
 
-    def age_tokens(self, ages: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    def age_tokens(
+        self, ages: torch.Tensor, *, dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
         """Return runtime age embeddings as `[N, 1, d_model]`.
 
         This is added after cross-attention, keeping the cross-attended event
@@ -134,13 +108,15 @@ class _CrossAttnBlock(nn.Module):
 
     def forward(
         self,
-        queries: torch.Tensor,         # [N, M, d_model]
-        keys_values: torch.Tensor,     # [N, K, d_model]
-        kv_padding_mask: torch.Tensor | None = None,  # [N, K] True for PAD
+        queries: torch.Tensor,
+        keys_values: torch.Tensor,
+        kv_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q = self.q_norm(queries)
         kv = self.kv_norm(keys_values)
-        out, _ = self.attn(q, kv, kv, key_padding_mask=kv_padding_mask, need_weights=False)
+        out, _ = self.attn(
+            q, kv, kv, key_padding_mask=kv_padding_mask, need_weights=False
+        )
         x = queries + out
         x = x + self.mlp(x)
         return x
@@ -173,16 +149,18 @@ class SegmentCrossAttention(nn.Module):
         else:
             self.patch_proj = nn.Identity()
         self.layers = nn.ModuleList(
-            [_CrossAttnBlock(d_model=d_model, num_heads=num_heads, dropout=dropout)
-             for _ in range(num_layers)]
+            [
+                _CrossAttnBlock(d_model=d_model, num_heads=num_heads, dropout=dropout)
+                for _ in range(num_layers)
+            ]
         )
         self.out_norm = nn.LayerNorm(d_model)
 
     def forward(
         self,
-        queries: torch.Tensor,            # [N, M, d_model]
-        kv_patches: torch.Tensor,         # [N, K, d_kv]
-        kv_padding_mask: torch.Tensor | None = None,  # [N, K] True = PAD
+        queries: torch.Tensor,
+        kv_patches: torch.Tensor,
+        kv_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         kv = self.patch_proj(kv_patches)
         x = queries

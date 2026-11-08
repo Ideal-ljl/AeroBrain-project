@@ -1,8 +1,4 @@
-"""Motion-Adaptive Memory (MAM) submodule.
-
-A chunk-native, action-saliency-driven memory encoder for VLA models. See
-`encoder.MAMMemoryEncoder` for the entry point.
-"""
+"""Motion-adaptive memory encoders and event selection."""
 
 from airbrain.memory.mam.encoder import MAMMemoryEncoder
 from airbrain.memory.mam.saliency import (

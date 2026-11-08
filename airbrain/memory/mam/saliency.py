@@ -1,14 +1,4 @@
-"""Saliency + event detection for Motion-Adaptive Memory.
-
-Implements the action-driven saliency signal validated in Phase 0 and reuses
-its NMS-based event detection, lifted from a script into a module that
-operates on batched tensors.
-
-The signal is intentionally simple: action novelty `||a_i - a_{i-1}||`, with
-an optional visual-novelty term. Per-sample saliency thresholding gives
-top-X% of NON-ZERO transitions; non-max suppression collapses sustained
-motion regions to a single peak.
-"""
+"""Action saliency and event selection for motion-adaptive memory."""
 
 from __future__ import annotations
 
@@ -25,12 +15,12 @@ class EventBudget:
     All tensors are batched and right-padded to a fixed cap.
     """
 
-    event_indices: torch.LongTensor   # [B, M_max] step indices, -1 for pad slots
-    event_mask: torch.BoolTensor      # [B, M_max] True for real events
-    num_events: torch.LongTensor      # [B] count of real events per sample
-    saliency: torch.Tensor            # [B, T] saliency score per step
-    n_action: torch.Tensor            # [B, T] normalized action novelty
-    n_visual: torch.Tensor            # [B, T] normalized visual novelty
+    event_indices: torch.LongTensor
+    event_mask: torch.BoolTensor
+    num_events: torch.LongTensor
+    saliency: torch.Tensor
+    n_action: torch.Tensor
+    n_visual: torch.Tensor
 
 
 def _robust_scale_batched(values: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -45,7 +35,9 @@ def _robust_scale_batched(values: torch.Tensor, eps: float = 1e-6) -> torch.Tens
     return medians.clamp_min(1e-8)
 
 
-def compute_action_novelty(actions: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+def compute_action_novelty(
+    actions: torch.Tensor, mask: torch.Tensor | None = None
+) -> torch.Tensor:
     """`||a_i - a_{i-1}||` along the time axis. `actions` shape `[B, T, A]`.
 
     Pad slots (where mask is False at either i or i-1) emit 0 novelty.
@@ -55,7 +47,7 @@ def compute_action_novelty(actions: torch.Tensor, mask: torch.Tensor | None = No
     out = actions.new_zeros((B, T))
     if T < 2:
         return out
-    diffs = torch.norm(actions[:, 1:] - actions[:, :-1], dim=-1)  # [B, T-1]
+    diffs = torch.norm(actions[:, 1:] - actions[:, :-1], dim=-1)
     if mask is not None:
         valid = mask[:, 1:].bool() & mask[:, :-1].bool()
         diffs = diffs * valid.to(diffs.dtype)
@@ -124,7 +116,9 @@ def compute_saliency(
     }
 
 
-def _nms_1d_single(saliency_row: torch.Tensor, candidates: list[int], min_gap: int) -> list[int]:
+def _nms_1d_single(
+    saliency_row: torch.Tensor, candidates: list[int], min_gap: int
+) -> list[int]:
     if min_gap <= 0 or not candidates:
         return sorted(candidates)
     ranked = sorted(candidates, key=lambda i: -float(saliency_row[i]))
@@ -149,7 +143,7 @@ def detect_events(
 
     For each batch item:
       1. Apply `chunk_boundary_mode` to derive forced event indices:
-         - "all":        every chunk_size step in the valid window (legacy)
+         - "all":        every chunk_size step in the valid window
          - "first_only": only the first valid step (lightweight anchor)
          - "none":       no forced events; rely entirely on saliency
       2. Pick steps where `s > τ` (τ = `tau_percentile` of NON-ZERO saliency).
@@ -173,7 +167,6 @@ def detect_events(
     chunk_size = max(1, int(chunk_size))
     nms_gap = max(0, int(nms_gap))
 
-    # Single sync: move both tensors to CPU once, then iterate in Python.
     saliency_cpu = saliency.detach().to("cpu", non_blocking=False)
     mask_cpu = mask.detach().to("cpu", non_blocking=False).bool()
     saliency_np = saliency_cpu.float().numpy()
@@ -190,25 +183,28 @@ def detect_events(
 
         if chunk_boundary_mode == "all":
             chunk_boundaries = [
-                i for i in range(first_valid, last_valid + 1, chunk_size) if i in valid_set
+                i
+                for i in range(first_valid, last_valid + 1, chunk_size)
+                if i in valid_set
             ]
         elif chunk_boundary_mode == "first_only":
             chunk_boundaries = [first_valid]
-        else:  # "none"
+        else:
             chunk_boundaries = []
 
         sal_row = saliency_np[b]
         valid_sal = sal_row[valid_steps]
         nz = valid_sal[valid_sal > 1e-6]
         if nz.size > 0:
-            # numpy percentile is faster than torch.quantile + .item() here.
+
             import numpy as np
+
             tau = float(np.quantile(nz, tau_percentile / 100.0))
         else:
             tau = 0.0
 
         raw_threshold = [int(i) for i in valid_steps if float(sal_row[i]) > tau]
-        # NMS on a 1-D numpy view (no GPU touch).
+
         if nms_gap > 0 and raw_threshold:
             ranked = sorted(raw_threshold, key=lambda i: -float(sal_row[i]))
             kept: list[int] = []
@@ -234,7 +230,6 @@ def detect_events(
 
         event_indices_cpu[b] = merged
 
-    # Build padded tensors on device in one shot.
     event_indices = torch.full((B, m_max), -1, dtype=torch.long, device=device)
     event_mask = torch.zeros((B, m_max), dtype=torch.bool, device=device)
     num_events = torch.zeros(B, dtype=torch.long, device=device)
@@ -265,15 +260,9 @@ def detect_events(
     )
 
 
-# ---------------------------------------------------------------------------
-# Single-sample, numpy-only helpers for dataset-side use (no torch ops on each
-# sample in dataloader workers → cheaper IPC + no tensor allocation overhead).
-# ---------------------------------------------------------------------------
-
-
 def detect_events_single(
-    actions: np.ndarray,           # [N, A]
-    mask: np.ndarray,              # [N] bool
+    actions: np.ndarray,
+    mask: np.ndarray,
     *,
     chunk_size: int,
     m_max: int,
@@ -301,7 +290,6 @@ def detect_events_single(
     chunk_size = max(1, int(chunk_size))
     nms_gap = max(0, int(nms_gap))
 
-    # ---- action novelty ----
     n_action_raw = np.zeros(N, dtype=np.float32)
     if N >= 2:
         diffs = np.linalg.norm(actions[1:] - actions[:-1], axis=-1)
@@ -312,7 +300,6 @@ def detect_events_single(
     sigma_a = float(np.median(nz)) + 1e-8 if nz.size > 0 else 1.0
     saliency = n_action_raw / sigma_a
 
-    # ---- event detection ----
     valid_steps = np.nonzero(mask)[0].tolist()
     if not valid_steps:
         return {
@@ -331,7 +318,7 @@ def detect_events_single(
         ]
     elif chunk_boundary_mode == "first_only":
         chunk_boundaries = [first_valid]
-    else:  # "none"
+    else:
         chunk_boundaries = []
 
     valid_sal = saliency[valid_steps]
@@ -362,7 +349,6 @@ def detect_events_single(
         if len(merged) > m_max:
             merged = merged[-m_max:]
 
-    # ---- seg_start / seg_end per event slot ----
     event_indices_pad = [-1] * m_max
     event_mask_list = [False] * m_max
     seg_start_list = [0] * m_max
@@ -383,56 +369,9 @@ def detect_events_single(
     }
 
 
-# ---------------------------------------------------------------------------
-# Causal (append-only) event detection.
-#
-# `detect_events_single` decides every event from window-relative statistics
-# (sigma = median of the window's non-zero novelty, tau = a percentile of it),
-# so a step that has already been committed can be re-partitioned once new
-# actions arrive and shift those statistics. Measured on 634 real episodes at
-# a 12-step replan cadence, 6.5% of co-existing events had their segment
-# boundaries rewritten between consecutive calls, which invalidates the
-# inference-time (abs_start, abs_end) content cache.
-#
-# The causal variant below decides each step exactly once, from data at or
-# before that step, against thresholds that never depend on the window:
-#
-#   (A) action transition : ||a_i - a_{i-1}|| > tau_action
-#   (B) segment length cap: i - last_event >= max_seg_steps
-#
-# Once committed an event is never revisited, so `seg_start[k] = event[k-1]`
-# is fixed at commit time and stays valid for the rest of the episode.
-#
-# (A) does essentially all the boundary detection: on its own it recovers 99.5%
-# of true turn boundaries (+/-3 steps). Turns are gradual -- ~14 steps, so only
-# 35% of boundary steps individually clear tau_action, but at least one step in
-# the ramp always does.
-#
-# (B) is NOT a second boundary detector -- adding it moves recall 99.5% -> 99.2%.
-# Its job is to bound segment length so the segment encoder (conv + masked mean
-# over the span) does not average a huge stretch into one mushy vector. It only
-# bites on the 34% of episodes that never turn: with no cap their longest
-# segment averages 44 steps and 8.7% of segments exceed 60, versus 0% at L=40.
-#
-# The cap is expressed in steps rather than distance travelled. Distance is the
-# more faithful quantity for "the view has changed by now", but in normalized
-# action space a stopped drone maps to (-1, 0, 0) and carries the same vector
-# magnitude as a cruising one, so integrating ||a[:3]|| would accrue distance
-# while hovering. Cruise speed is near-constant here (normalized per-step
-# magnitude is 1.00 +/- 0.06 across all seven repos), making step count an
-# equivalent and normalization-proof proxy. Swap in a true path-length term if
-# a dataset with substantial hovering shows up.
-#
-# Budget note: keep `m_max` loose (12, the launcher default). Compaction drops
-# empty slots before the VLM prefix, so a larger cap costs padding but almost no
-# real tokens (m_max 6 -> 12 moves the compacted prefix from 21.2 to 23.6
-# tokens) -- while m_max=6 evicts the oldest segment on 39% of episodes.
-# ---------------------------------------------------------------------------
-
-
 def detect_events_causal_single(
-    actions: np.ndarray,           # [N, A]
-    mask: np.ndarray,              # [N] bool
+    actions: np.ndarray,
+    mask: np.ndarray,
     *,
     m_max: int,
     tau_action: float = 0.30,
@@ -491,7 +430,7 @@ def detect_events_causal_single(
             continue
         if i - committed[-1] < min_gap:
             continue
-        # Novelty is only defined across a pair of valid steps.
+
         if (i - 1) in valid_set:
             novelty = float(np.linalg.norm(actions[i] - actions[i - 1]))
         else:
@@ -502,12 +441,6 @@ def detect_events_causal_single(
     if live_tail and committed[-1] != last_valid:
         committed.append(last_valid)
 
-    # Pair each event with its predecessor FIRST, then evict whole segments.
-    # Evicting events instead would silently rewrite the survivors: the event
-    # that becomes the oldest kept one would lose its real predecessor and fall
-    # back to `seg_start = itself`, which is exactly the re-partition this mode
-    # exists to prevent. Eviction is by age, not by score, so a surviving
-    # segment's (start, end) pair is fixed for the rest of the episode.
     segments = [
         (committed[k - 1] if k > 0 else committed[k], committed[k])
         for k in range(len(committed))

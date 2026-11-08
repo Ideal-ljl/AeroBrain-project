@@ -1,19 +1,4 @@
-"""Top-level Motion-Adaptive Memory encoder (two-stage interface).
-
-Stage 1 — event selection (action-only, no vision tower):
-  saliency(actions, mask) → detect_events → events + per-event segment endpoints
-
-Stage 2 — encoding (after the caller has run vision tower on selected anchors only):
-  encode(actions, mask, events, seg_endpoints, endpoint_patches) → memory tokens
-
-The two-stage split lets callers run the vision tower on the ~M_max selected
-anchor frames instead of all N history frames, which is the main GPU efficiency
-win for chunk-stride training.
-
-Output:
-  tokens : [B, M_max × tokens_per_event, d_model]
-  mask   : [B, M_max × tokens_per_event]
-"""
+"""Encode action segments and endpoint image patches as memory tokens."""
 
 from __future__ import annotations
 
@@ -42,7 +27,7 @@ class MAMMemoryEncoder(nn.Module):
         tokens_per_event: int = 2,
         nms_gap: int = -1,
         tau_percentile: float = 80.0,
-        lambda_visual: float = 1.0,   # retained for backwards compat; ignored by select_events
+        lambda_visual: float = 1.0,
         num_heads: int = 4,
         num_layers: int = 1,
         dropout: float = 0.0,
@@ -88,19 +73,13 @@ class MAMMemoryEncoder(nn.Module):
             patch_proj_dim=self.patch_dim,
         )
 
-        # Trainable embedding to mark empty / no-event slots so the
-        # cross-attention has something legal to attend to.
         self.empty_kv_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
         nn.init.normal_(self.empty_kv_token, std=0.02)
 
-    # ------------------------------------------------------------------
-    # Stage 1: event selection (action-only, no vision features needed)
-    # ------------------------------------------------------------------
-
     def select_events(
         self,
-        history_actions: torch.Tensor,    # [B, T, A]
-        history_mask: torch.Tensor,       # [B, T]
+        history_actions: torch.Tensor,
+        history_mask: torch.Tensor,
     ) -> tuple[EventBudget, torch.Tensor, torch.Tensor]:
         """Detect events from actions alone.
 
@@ -113,17 +92,21 @@ class MAMMemoryEncoder(nn.Module):
         seg_end :   [B, M_max] step index of segment end (= event index).
         """
         if history_actions.ndim != 3:
-            raise ValueError(f"history_actions must be [B, T, A], got {tuple(history_actions.shape)}")
+            raise ValueError(
+                f"history_actions must be [B, T, A], got {tuple(history_actions.shape)}"
+            )
         B, T, A = history_actions.shape
         if A != self.action_dim:
             raise ValueError(f"expected action_dim={self.action_dim}, got {A}")
         if history_mask.shape != (B, T):
-            raise ValueError(f"history_mask shape mismatch: expected {(B, T)}, got {tuple(history_mask.shape)}")
+            raise ValueError(
+                f"history_mask shape mismatch: expected {(B, T)}, got {tuple(history_mask.shape)}"
+            )
         device = history_actions.device
 
         sal_info = compute_saliency(
             history_actions,
-            pooled_visual=None,           # action-only — no vision tower required yet
+            pooled_visual=None,
             mask=history_mask,
             lambda_visual=0.0,
         )
@@ -137,7 +120,6 @@ class MAMMemoryEncoder(nn.Module):
             chunk_boundary_mode=self.chunk_boundary_mode,
         )
 
-        # Prefetch to CPU once to avoid B × M_max GPU syncs in the loop body.
         first_valid_cpu = history_mask.long().argmax(dim=1).cpu().tolist()
         event_mask_cpu = events.event_mask.cpu().tolist()
         event_indices_cpu = events.event_indices.cpu().tolist()
@@ -163,17 +145,13 @@ class MAMMemoryEncoder(nn.Module):
         seg_end = torch.tensor(seg_end_list, dtype=torch.long, device=device)
         return events, seg_start, seg_end
 
-    # ------------------------------------------------------------------
-    # Stage 2: cross-attention encoding with pre-gathered anchor features
-    # ------------------------------------------------------------------
-
     def build_event_segments(
         self,
         *,
-        history_actions: torch.Tensor,           # [B, T, A]
-        event_mask: torch.Tensor,                # [B, M_max]
-        seg_start: torch.Tensor,                 # [B, M_max]
-        seg_end: torch.Tensor,                   # [B, M_max]
+        history_actions: torch.Tensor,
+        event_mask: torch.Tensor,
+        seg_start: torch.Tensor,
+        seg_end: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather per-event action segments and runtime ages."""
         if history_actions.ndim != 3:
@@ -194,7 +172,6 @@ class MAMMemoryEncoder(nn.Module):
         action_dim = self.action_dim
         L_max = T
 
-        # Single sync: pull all needed indices to CPU and build host-side lists.
         event_mask_cpu = event_mask.cpu().tolist()
         seg_start_cpu = seg_start.cpu().tolist()
         seg_end_cpu = seg_end.cpu().tolist()
@@ -206,7 +183,7 @@ class MAMMemoryEncoder(nn.Module):
 
         for b in range(B):
             n_evt = n_evt_per_sample[b]
-            ha_b = history_actions[b]  # [T, A] — single tensor view, no per-step sync
+            ha_b = history_actions[b]
             for k in range(self.m_max):
                 if not event_mask_cpu[b][k]:
                     continue
@@ -226,10 +203,10 @@ class MAMMemoryEncoder(nn.Module):
     def encode_event_content(
         self,
         *,
-        segment_actions: torch.Tensor,          # [N, L_max, A]
-        segment_lengths: torch.Tensor,          # [N]
-        endpoint_features: torch.Tensor,        # [N, 2, K_max, d_patch]
-        endpoint_patch_mask: torch.Tensor,      # [N, 2, K_max] True = valid
+        segment_actions: torch.Tensor,
+        segment_lengths: torch.Tensor,
+        endpoint_features: torch.Tensor,
+        endpoint_patch_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Encode age-independent event content tokens.
 
@@ -270,17 +247,14 @@ class MAMMemoryEncoder(nn.Module):
         if self.detach_features:
             kv_buf = kv_buf.detach()
 
-        # A cache miss should normally correspond to a real event with real
-        # anchors. Keep the empty-slot fallback here so the public helper remains
-        # legal for padded slots and mirrors encode().
-        empty_slots = (~endpoint_patch_mask.reshape(N, 2 * K_max).any(dim=1))
+        empty_slots = ~endpoint_patch_mask.reshape(N, 2 * K_max).any(dim=1)
         if empty_slots.any():
             slot_idx = empty_slots.nonzero(as_tuple=False).flatten()
-            empty_tok = self.empty_kv_token.to(dtype=kv_buf.dtype, device=device).view(-1)
+            empty_tok = self.empty_kv_token.to(dtype=kv_buf.dtype, device=device).view(
+                -1
+            )
             d_use = min(kv_buf.shape[-1], empty_tok.numel())
-            # `reshape` (and `detach`) return views sharing storage with the
-            # caller's `endpoint_features`, so writing the empty-slot token in
-            # place would mutate the caller's tensor. Clone first.
+
             kv_buf = kv_buf.clone()
             for row in slot_idx.tolist():
                 kv_buf[row, 0, :d_use] = empty_tok[:d_use]
@@ -293,13 +267,13 @@ class MAMMemoryEncoder(nn.Module):
     def encode(
         self,
         *,
-        history_actions: torch.Tensor,           # [B, T, A]
-        history_mask: torch.Tensor,              # [B, T]
-        events: EventBudget,                     # from select_events
-        seg_start: torch.Tensor,                 # [B, M_max]
-        seg_end: torch.Tensor,                   # [B, M_max]
-        endpoint_features: torch.Tensor,         # [B, M_max, 2, K_max, d_patch]
-        endpoint_patch_mask: torch.Tensor,       # [B, M_max, 2, K_max] True = valid
+        history_actions: torch.Tensor,
+        history_mask: torch.Tensor,
+        events: EventBudget,
+        seg_start: torch.Tensor,
+        seg_end: torch.Tensor,
+        endpoint_features: torch.Tensor,
+        endpoint_patch_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Cross-attention given pre-gathered start/end frame patches.
 
@@ -318,9 +292,6 @@ class MAMMemoryEncoder(nn.Module):
             seg_end=seg_end,
         )
 
-        # --- build KV buffer from endpoint features ---
-        # endpoint_features layout: [B, m_max, 2, K_max, d_patch]
-        # Flatten 2 endpoints into a single sequence per event → [B, m_max, 2*K_max, d_patch]
         if endpoint_features.ndim != 5:
             raise ValueError(
                 f"endpoint_features must be [B, m_max, 2, K_max, d_patch], "
@@ -335,20 +306,23 @@ class MAMMemoryEncoder(nn.Module):
         seg_lengths_flat = seg_lengths.reshape(B * self.m_max)
         ages_flat = ages.reshape(B * self.m_max)
 
-        # --- cross-attention ---
         content_tokens = self.encode_event_content(
             segment_actions=seg_actions_flat,
             segment_lengths=seg_lengths_flat,
             endpoint_features=endpoint_features.reshape(
-                B * self.m_max, 2, endpoint_features.shape[3], endpoint_features.shape[4]
+                B * self.m_max,
+                2,
+                endpoint_features.shape[3],
+                endpoint_features.shape[4],
             ),
             endpoint_patch_mask=endpoint_patch_mask.reshape(
                 B * self.m_max, 2, endpoint_features.shape[3]
             ),
         )
-        # [B*m_max, tokens_per_event, d_model]; independent of age/recency and
-        # therefore cacheable for a fixed event segment + visual endpoints.
-        age_tokens = self.action_encoder.age_tokens(ages_flat, dtype=content_tokens.dtype)
+
+        age_tokens = self.action_encoder.age_tokens(
+            ages_flat, dtype=content_tokens.dtype
+        )
         out = content_tokens + age_tokens
 
         content_memory_tokens = content_tokens.reshape(
@@ -358,12 +332,16 @@ class MAMMemoryEncoder(nn.Module):
             B, self.m_max * self.tokens_per_event, self.d_model
         )
         memory_tokens = out.reshape(B, self.m_max, self.tokens_per_event, self.d_model)
-        memory_tokens = memory_tokens.reshape(B, self.m_max * self.tokens_per_event, self.d_model)
+        memory_tokens = memory_tokens.reshape(
+            B, self.m_max * self.tokens_per_event, self.d_model
+        )
 
         token_mask = event_mask.unsqueeze(-1).expand(-1, -1, self.tokens_per_event)
         token_mask = token_mask.reshape(B, self.m_max * self.tokens_per_event)
         memory_tokens = memory_tokens * token_mask.unsqueeze(-1).to(memory_tokens.dtype)
-        content_memory_tokens = content_memory_tokens * token_mask.unsqueeze(-1).to(content_memory_tokens.dtype)
+        content_memory_tokens = content_memory_tokens * token_mask.unsqueeze(-1).to(
+            content_memory_tokens.dtype
+        )
 
         return {
             "tokens": memory_tokens,

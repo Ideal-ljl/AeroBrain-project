@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aerobrain"
-version = "5.0.0"
-description = "Final v5 MSP + MAM model and checkpoint loading"
+version = "0.1.0"
+description = "MSP + MAM model and checkpoint loading"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.6", "transformers==5.5.0", "safetensors>=0.7", "numpy", "Pillow"]
 
@@ -15,3 +15,6 @@ py-modules = ["load_model"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["openfly_his*", "airbrain*"]
+
+[tool.black]
+target-version = ["py310"]
