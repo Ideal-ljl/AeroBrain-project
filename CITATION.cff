@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite this repository using the metadata below."
+type: software
+title: "AeroBrain: Motion-Adaptive Memory and Template Motion Priors for Aerial Navigation"
+authors:
+  - family-names: "Liu"
+    given-names: "Junli"
+url: "https://github.com/Ideal-ljl/AeroBrain-project"
+repository-code: "https://github.com/Ideal-ljl/AeroBrain-project"
+abstract: >-
+  AeroBrain provides model definitions and checkpoint loading for an aerial
+  vision-language-action model combining a Qwen3.5 backbone, Motion-Adaptive
+  Memory, a template motion prior, and an action Expert. The source includes
+  a synthetic CPU checkpoint and inference verification test. Trained weights,
+  datasets, and navigation benchmarks are not included.
+keywords:
+  - aerial navigation
+  - vision-language-action models
+  - motion-adaptive memory
+  - motion priors
+  - robotics

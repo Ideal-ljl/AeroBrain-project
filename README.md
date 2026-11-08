@@ -61,3 +61,7 @@ Choose the environment matching the observation; the example uses the first conf
 ## Verification
 
 See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the tested environment and a self-contained CPU checkpoint/inference test.
+
+## Citation
+
+Software author: Junli Liu. Machine-readable citation metadata is provided in [CITATION.cff](CITATION.cff).
