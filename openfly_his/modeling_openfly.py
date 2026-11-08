@@ -1458,7 +1458,8 @@ class OpenFLYModel(PreTrainedModel, GenerationMixin):
         gmm_generator=None,
         motion_environment: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
+        """Return the generated action chunk and its sampled source noise."""
         device = next(self.parameters()).device
         mam_prefix_tokens, mam_prefix_mask = self._make_mam_memory_prefix(
             batch_size=input_ids.shape[0],
