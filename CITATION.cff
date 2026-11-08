@@ -1,6 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite this repository using the metadata below."
 type: software
+license: Apache-2.0
 title: "AeroBrain: Motion-Adaptive Memory and Template Motion Priors for Aerial Navigation"
 authors:
   - family-names: "Liu"

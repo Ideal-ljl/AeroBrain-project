@@ -1,0 +1,12 @@
+AeroBrain
+Copyright 2026 Junli Liu
+
+This product includes adaptations of Qwen3.5 modeling components from
+Hugging Face Transformers (https://github.com/huggingface/transformers).
+Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+These components are licensed under the Apache License, Version 2.0.
+
+The adaptations in openfly_his/modeling_expert.py implement action-chunk
+processing and the sharing of recurrent attention state with the vision-language
+backbone. Other AeroBrain components provide motion-adaptive memory, template
+motion priors, and checkpoint loading.

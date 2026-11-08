@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "MSP + MAM model and checkpoint loading"
 readme = "README.md"
 authors = [{name = "Junli Liu"}]
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = ["torch>=2.6", "transformers==5.5.0", "safetensors>=0.7", "numpy", "Pillow"]
 
@@ -19,6 +20,7 @@ Issues = "https://github.com/Ideal-ljl/AeroBrain-project/issues"
 test = ["pytest>=8,<9"]
 
 [tool.setuptools]
+license-files = ["LICENSE", "NOTICE"]
 py-modules = ["load_model"]
 
 [tool.setuptools.packages.find]

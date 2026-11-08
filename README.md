@@ -65,3 +65,7 @@ See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the tested environment and a se
 ## Citation
 
 Software author: Junli Liu. Machine-readable citation metadata is provided in [CITATION.cff](CITATION.cff).
+
+## License
+
+The code is licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for copyright and attribution information.

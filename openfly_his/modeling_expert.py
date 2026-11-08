@@ -1,3 +1,7 @@
+# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Junli Liu. Modified for action chunks and shared prefix state.
+# SPDX-License-Identifier: Apache-2.0
+
 """Qwen action Expert with rotary attention and shared prefix state."""
 
 from dataclasses import dataclass
